@@ -25,6 +25,7 @@ def parse_wide(df: pd.DataFrame) -> pd.DataFrame:
       - Grid: numeric values
     Returns: DataFrame index=ticker, columns=datetime (unique), values=float.
     Handles duplicate dates by collapsing duplicates, keeping the RIGHTMOST non-null.
+    Uses *positional* indexing to avoid Pandas' label->DataFrame behavior on dups.
     """
     if df.empty:
         return df
@@ -39,21 +40,21 @@ def parse_wide(df: pd.DataFrame) -> pd.DataFrame:
     df.rename(columns={df.columns[0]: "Ticker"}, inplace=True)
     df["Ticker"] = df["Ticker"].astype(str).str.strip()
 
-    # 3) Parse date headers (allow multiple formats)
-    date_cols_raw = [c for c in df.columns if c != "Ticker"]
-    parsed_dates = []
-    for c in date_cols_raw:
+    # 3) Parse date headers (allow multiple formats); build a map from raw->parsed
+    raw_date_cols = [c for c in df.columns if c != "Ticker"]
+    parsed_dates: list[pd.Timestamp] = []
+    for c in raw_date_cols:
         dt = pd.to_datetime(c, errors="coerce", dayfirst=False)
         if pd.isna(dt):
             dt = pd.to_datetime(c, errors="coerce", dayfirst=True)
         parsed_dates.append(dt)
 
-    # Keep only columns that parsed to a real datetime
+    # Keep only successfully-parsed dates
     keep_mask = [pd.notna(x) for x in parsed_dates]
-    kept_raw = [c for c, k in zip(date_cols_raw, keep_mask) if k]
+    kept_raw = [c for c, k in zip(raw_date_cols, keep_mask) if k]
     kept_parsed = [d for d in parsed_dates if pd.notna(d)]
 
-    # 4) Subset and rename to parsed datetime column names
+    # 4) Subset to Ticker + kept date cols and rename columns to parsed datetimes
     sub = df[["Ticker"] + kept_raw].copy()
     rename_map = {old: new for old, new in zip(kept_raw, kept_parsed)}
     sub.rename(columns=rename_map, inplace=True)
@@ -61,34 +62,41 @@ def parse_wide(df: pd.DataFrame) -> pd.DataFrame:
     # 5) Index by ticker
     sub.set_index("Ticker", inplace=True)
 
-    # 6) Handle duplicate datetime columns robustly
-    value_cols = list(sub.columns)
-    if len(value_cols) != len(set(value_cols)):
-        # Collapse duplicates: RIGHTMOST non-null wins
-        combined = {}
-        # preserve chronological order for final sort; grouping by exact datetime value
-        unique_dates = sorted(set(value_cols))
-        # We need original column order to ensure "rightmost wins"
-        original_order = list(sub.columns)
-        for d in unique_dates:
-            dupes = [col for col in original_order if col == d]
-            # Start with all-NaN
-            cur = pd.Series(np.nan, index=sub.index, dtype="float64")
-            # Iterate LEFT->RIGHT but assign using series.combine_first(cur) so later (right) overrides earlier
-            for col in dupes:
-                series = pd.to_numeric(sub[col], errors="coerce")
-                cur = series.combine_first(cur)
-            combined[d] = cur
-        sub = pd.DataFrame(combined, index=sub.index)
-    else:
-        # Columns are unique; simple numeric coercion
-        for c in value_cols:
-            sub[c] = pd.to_numeric(sub[c], errors="coerce")
+    # 6) Collapse duplicate datetime columns using *positional* indexing so we never
+    #    hit the "label returns a DataFrame" case.
+    col_labels = list(sub.columns)                 # these are datetimes, may have duplicates
+    unique_dates = sorted(set(col_labels))
 
-    # 7) Sort columns chronologically
+    # Fast path: no duplicates → simple numeric coercion and sort
+    if len(unique_dates) == len(col_labels):
+        for j in range(len(col_labels)):
+            sub.iloc[:, j] = pd.to_numeric(sub.iloc[:, j], errors="coerce")
+        return sub.reindex(sorted(sub.columns), axis=1)
+
+    # Slow path: duplicates present → combine rightmost non-null
+    # Build a dict of {date: combined_series}
+    combined = {}
+    # Record original positions so we can access columns by iloc
+    positions_by_date = {}
+    for pos, lbl in enumerate(col_labels):
+        positions_by_date.setdefault(lbl, []).append(pos)
+
+    for d in unique_dates:
+        pos_list = positions_by_date[d]  # column positions with this datetime label, in left→right order
+        # Start as all-NaN; we'll let RIGHTMOST values win by combining left→right with combine_first on the *current* series
+        cur = pd.Series(np.nan, index=sub.index, dtype="float64")
+        for pos in pos_list:
+            series = pd.to_numeric(sub.iloc[:, pos], errors="coerce")
+            # RIGHTMOST wins: current (later) series overrides previous via combine_first
+            cur = series.combine_first(cur)
+        combined[d] = cur
+
+    sub = pd.DataFrame(combined, index=sub.index)
+
+    # 7) Final chronological ordering of columns
     sub = sub.reindex(sorted(sub.columns), axis=1)
-
     return sub
+
 
 
 @st.cache_data(show_spinner=False)
